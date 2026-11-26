@@ -4,13 +4,24 @@ import { setGetRequestBody } from '../utils/node/index.ts'
 import { BatchInterceptor } from '@mswjs/interceptors'
 import { FetchInterceptor } from '@mswjs/interceptors/fetch'
 import { HttpRequestInterceptor } from '@mswjs/interceptors/http'
+import {
+  discardCapturedRequestBody,
+  installClientRequestBodyCapture,
+  readCapturedRequestBody,
+  uninstallClientRequestBodyCapture,
+} from './client-request-body.ts'
 
 const interceptor = new BatchInterceptor({
   name: 'intercept',
   interceptors: [new HttpRequestInterceptor(), new FetchInterceptor()],
 })
 
+function methodDisallowsFetchBody(method: string): boolean {
+  return method === 'GET' || method === 'HEAD'
+}
+
 function activate() {
+  installClientRequestBodyCapture()
   interceptor.apply()
 
   // Force msw to forward Nock's error instead of coerce it into 500 error
@@ -25,19 +36,35 @@ function activate() {
         return
       }
 
-      // If this is GET request with body, we need to read the body from the socket because Fetch API doesn't support this.
+      // Fetch refuses bodies on GET and HEAD, and `@mswjs/interceptors`
+      // therefore reports an empty body. Recover the bytes from the
+      // underlying ClientRequest when that happens.
+      let rawBody: ArrayBuffer | Buffer = await request.clone().arrayBuffer()
+      if (methodDisallowsFetchBody(request.method)) {
+        if (rawBody.byteLength === 0) {
+          const captured = await readCapturedRequestBody(request, initiator)
+          if (captured && captured.byteLength > 0) rawBody = captured
+        } else {
+          discardCapturedRequestBody(request, initiator)
+        }
+      }
+
       const requestBodyBuffer: ArrayBuffer = common.decompressRequestBody(
-        await request.clone().arrayBuffer(),
+        rawBody as ArrayBuffer,
         request.headers.get('content-encoding') || '',
       ) as ArrayBuffer
 
       const decompressedRequest = new Request(request, {
         body:
-          requestBodyBuffer.byteLength > 0 && request.method !== 'GET'
+          requestBodyBuffer.byteLength > 0 &&
+          !methodDisallowsFetchBody(request.method)
             ? requestBodyBuffer
             : undefined,
       })
-      if (requestBodyBuffer.byteLength > 0 && request.method === 'GET') {
+      if (
+        requestBodyBuffer.byteLength > 0 &&
+        methodDisallowsFetchBody(request.method)
+      ) {
         setGetRequestBody(decompressedRequest, requestBodyBuffer)
       }
 
@@ -51,6 +78,7 @@ function activate() {
 
 function deactivate() {
   interceptor.dispose()
+  uninstallClientRequestBodyCapture()
 }
 
 export { activate, deactivate }
